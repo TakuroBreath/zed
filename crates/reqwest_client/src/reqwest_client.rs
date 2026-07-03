@@ -30,6 +30,13 @@ impl ReqwestClient {
         reqwest::Client::builder()
             .use_rustls_tls()
             .connect_timeout(Duration::from_secs(10))
+            // NOTE (fork): do NOT add `.read_timeout(...)` here. reqwest's
+            // `ReadTimeoutBody` calls `tokio::time::sleep`, which panics with
+            // "no reactor running" when the streamed response body is polled on
+            // GPUI's executor (outside a Tokio runtime) — every startup HTTP
+            // fetch (agent registry, extension list, ...) would crash. Upstream
+            // added it in #60301 and then reverted it in #60321; keep it out
+            // until bodies are read within the Tokio handle context.
             // Detect and drop connections that have silently gone bad on a
             // flaky path (NAT timeouts, resets) instead of reusing them. A
             // stale reused HTTP/2 connection is a common source of
