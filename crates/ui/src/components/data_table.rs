@@ -13,7 +13,7 @@ use crate::{
     v_flex,
 };
 use gpui::{
-    AbsoluteLength, DefiniteLength, DragMoveEvent, Entity, EntityId, FocusHandle, Length,
+    AbsoluteLength, DefiniteLength, DragMoveEvent, Entity, EntityId, FocusHandle, Hsla, Length,
     ListHorizontalSizingBehavior, ListSizingBehavior, ListState, Point, ScrollHandle, Stateful,
     UniformListScrollHandle, WeakEntity, list, transparent_black, uniform_list,
 };
@@ -368,6 +368,7 @@ pub struct Table {
     cols: usize,
     disable_base_cell_style: bool,
     pinned_cols: usize,
+    header_background: Option<Hsla>,
     /// Optional per-column visibility mask. When set, it overrides any filter derived from the
     /// column width config. Columns whose entry is `true` are hidden.
     column_filter: Option<TableRow<bool>>,
@@ -390,6 +391,7 @@ impl Table {
             disable_base_cell_style: false,
             column_width_config: ColumnWidthConfig::auto(),
             pinned_cols: 0,
+            header_background: None,
             column_filter: None,
         }
     }
@@ -462,6 +464,13 @@ impl Table {
     /// Enables row striping (alternating row colors)
     pub fn striped(mut self) -> Self {
         self.striped = true;
+        self
+    }
+
+    /// Sets a background color for the header row. Opt-in: without calling
+    /// this, the header row keeps its default transparent background.
+    pub fn header_background(mut self, color: Hsla) -> Self {
+        self.header_background = Some(color);
         self
     }
 
@@ -756,7 +765,10 @@ pub fn render_table_header(
         .items_center()
         .w_full()
         .border_b_1()
-        .border_color(cx.theme().colors().border);
+        .border_color(cx.theme().colors().border)
+        .when_some(table_context.header_background, |this, color| {
+            this.bg(color)
+        });
 
     let use_ui_font = table_context.use_ui_font;
     let resize_info_ref = resize_info.as_ref();
@@ -874,6 +886,7 @@ pub struct TableRenderContext {
     /// When `pinned_cols > 0`, each row's scrollable section tracks this handle so all rows
     /// scroll together without requiring per-scroll re-renders.
     pub h_scroll_handle: Option<ScrollHandle>,
+    pub header_background: Option<Hsla>,
 }
 
 impl TableRenderContext {
@@ -893,6 +906,7 @@ impl TableRenderContext {
             pinned_cols: table.pinned_cols,
             column_filter: table.column_filter.clone(),
             h_scroll_handle,
+            header_background: table.header_background,
         }
     }
 
@@ -909,6 +923,7 @@ impl TableRenderContext {
             pinned_cols: 0,
             column_filter: None,
             h_scroll_handle: None,
+            header_background: None,
         }
     }
 
