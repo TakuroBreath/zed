@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- Forge app icon: code angle-brackets embracing a forge spark.
+       Editor (< >) × forge (ember spark). macOS icon grid: 824x824
+       squircle centred in a 1024 canvas (~100px padding). -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2E2D36"/>
+      <stop offset="1" stop-color="#141319"/>
+    </linearGradient>
+    <linearGradient id="gloss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.12"/>
+      <stop offset="0.42" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="br" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FBF1E4"/>
+      <stop offset="1" stop-color="#D2BC9F"/>
+    </linearGradient>
+    <linearGradient id="spark" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFD770"/>
+      <stop offset="1" stop-color="#FF5A12"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="184" fill="url(#bg)"/>
+  <rect x="100" y="100" width="824" height="824" rx="184" fill="url(#gloss)"/>
+  <g fill="none" stroke="url(#br)" stroke-width="58" stroke-linecap="round" stroke-linejoin="round">
+    <polyline points="470,320 292,512 470,704"/>
+    <polyline points="554,320 732,512 554,704"/>
+  </g>
+  <path d="M512 416 C 527 489, 535 497, 608 512 C 535 527, 527 535, 512 608 C 497 535, 489 527, 416 512 C 489 497, 497 489, 512 416 Z" fill="url(#spark)"/>
+</svg>

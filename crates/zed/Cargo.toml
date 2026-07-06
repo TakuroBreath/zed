@@ -284,7 +284,7 @@ repl = { workspace = true, features = ["test-support"] }
 # release feed. Config dir on macOS (`~/.config/zed`) is shared across
 # channels, so Forge picks up the user's existing Zed settings.
 [package.metadata.bundle-dev]
-icon = ["resources/app-icon-dev@2x.png", "resources/app-icon-dev.png"]
+icon = ["resources/app-icon-forge@2x.png", "resources/app-icon-forge.png"]
 identifier = "dev.zed.Forge"
 name = "Forge"
 osx_minimum_system_version = "10.15.7"
