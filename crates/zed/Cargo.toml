@@ -276,10 +276,17 @@ repl = { workspace = true, features = ["test-support"] }
 
 
 
+# Fork identity: this repurposes the `dev` channel's bundle metadata so a
+# local `script/bundle-mac` (RELEASE_CHANNEL=dev) produces a standalone
+# `Forge.app` with its own bundle identifier, distinct from an installed
+# upstream Zed (`dev.zed.Zed`) so the two don't collide. The `dev` channel is
+# kept (rather than `stable`) so the fork never auto-updates against Zed's
+# release feed. Config dir on macOS (`~/.config/zed`) is shared across
+# channels, so Forge picks up the user's existing Zed settings.
 [package.metadata.bundle-dev]
 icon = ["resources/app-icon-dev@2x.png", "resources/app-icon-dev.png"]
-identifier = "dev.zed.Zed-Dev"
-name = "Zed Dev"
+identifier = "dev.zed.Forge"
+name = "Forge"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
 osx_url_schemes = ["zed"]
