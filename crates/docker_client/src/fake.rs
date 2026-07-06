@@ -32,6 +32,7 @@ pub struct FakeDockerClient {
     compose_up_error: Mutex<Option<String>>,
     compose_down_error: Mutex<Option<String>>,
     compose_restart_error: Mutex<Option<String>>,
+    compose_pull_and_redeploy_error: Mutex<Option<String>>,
     container_logs_error: Mutex<Option<String>>,
     calls: Mutex<Vec<String>>,
 }
@@ -68,6 +69,7 @@ impl FakeDockerClient {
             compose_up_error: Mutex::new(None),
             compose_down_error: Mutex::new(None),
             compose_restart_error: Mutex::new(None),
+            compose_pull_and_redeploy_error: Mutex::new(None),
             container_logs_error: Mutex::new(None),
             calls: Mutex::new(Vec::new()),
         }
@@ -213,6 +215,14 @@ impl FakeDockerClient {
     /// `error` which fails every method.
     pub fn set_compose_restart_error(&self, error: Option<String>) {
         if let Ok(mut slot) = self.compose_restart_error.lock() {
+            *slot = error;
+        }
+    }
+
+    /// Sets or clears an error that fails only `compose_pull_and_redeploy`,
+    /// unlike `error` which fails every method.
+    pub fn set_compose_pull_and_redeploy_error(&self, error: Option<String>) {
+        if let Ok(mut slot) = self.compose_pull_and_redeploy_error.lock() {
             *slot = error;
         }
     }
@@ -386,6 +396,21 @@ impl DockerClient for FakeDockerClient {
         Ok(())
     }
 
+    async fn compose_pull_and_redeploy(
+        &self,
+        endpoint: &DockerEndpoint,
+        project: &str,
+        service: Option<&str>,
+    ) -> Result<()> {
+        self.check_error()?;
+        self.record(format!(
+            "compose_pull_and_redeploy {} {project} service={service:?}",
+            endpoint.name
+        ));
+        self.check_override(&self.compose_pull_and_redeploy_error)?;
+        Ok(())
+    }
+
     async fn container_logs(
         &self,
         endpoint: &DockerEndpoint,
@@ -500,6 +525,43 @@ mod tests {
             read_only: false,
         };
         assert!(fake.compose_up(&ep, "shop", None).await.is_err());
+        assert!(fake.list_containers(&ep).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn fake_compose_pull_and_redeploy_records_expected_call() {
+        let fake = FakeDockerClient::new();
+        let ep = DockerEndpoint {
+            name: "local".into(),
+            kind: EndpointKind::Local,
+            read_only: false,
+        };
+        assert!(
+            fake.compose_pull_and_redeploy(&ep, "shop", None)
+                .await
+                .is_ok()
+        );
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|c| c == "compose_pull_and_redeploy local shop service=None")
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_compose_pull_and_redeploy_error_override_isolated_to_one_method() {
+        let fake = FakeDockerClient::new();
+        fake.set_compose_pull_and_redeploy_error(Some("boom".into()));
+        let ep = DockerEndpoint {
+            name: "local".into(),
+            kind: EndpointKind::Local,
+            read_only: false,
+        };
+        assert!(
+            fake.compose_pull_and_redeploy(&ep, "shop", None)
+                .await
+                .is_err()
+        );
         assert!(fake.list_containers(&ep).await.is_ok());
     }
 }

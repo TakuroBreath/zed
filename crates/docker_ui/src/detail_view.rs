@@ -374,6 +374,16 @@ fn render_compose_detail(
                     },
                     endpoint,
                     cx,
+                ))
+                .child(action_button(
+                    "compose-pull-redeploy",
+                    "Pull & Redeploy",
+                    DockerAction::ComposePullRedeploy {
+                        project: project.to_string(),
+                        service: None,
+                    },
+                    endpoint,
+                    cx,
                 )),
         )
         .into_any_element()

@@ -170,6 +170,12 @@ pub trait DockerClient: Send + Sync {
         project: &str,
         service: Option<&str>,
     ) -> Result<()>;
+    async fn compose_pull_and_redeploy(
+        &self,
+        endpoint: &DockerEndpoint,
+        project: &str,
+        service: Option<&str>,
+    ) -> Result<()>;
     async fn container_logs(
         &self,
         endpoint: &DockerEndpoint,

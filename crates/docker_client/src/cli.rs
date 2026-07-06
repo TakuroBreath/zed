@@ -157,6 +157,29 @@ impl DockerClient for CliDockerClient {
         Ok(())
     }
 
+    async fn compose_pull_and_redeploy(
+        &self,
+        endpoint: &DockerEndpoint,
+        project: &str,
+        service: Option<&str>,
+    ) -> Result<()> {
+        // Pull the latest image(s) first, then recreate containers with `up
+        // -d` so the new image is actually used. `up -d` recreates only
+        // containers whose config/image changed. See the comment in
+        // `compose_up`: compose subcommands are not `--`-guarded.
+        let mut pull_args = vec!["compose", "-p", project, "pull"];
+        if let Some(service) = service {
+            pull_args.push(service);
+        }
+        run(endpoint, &pull_args).await?;
+        let mut up_args = vec!["compose", "-p", project, "up", "-d"];
+        if let Some(service) = service {
+            up_args.push(service);
+        }
+        run(endpoint, &up_args).await?;
+        Ok(())
+    }
+
     async fn container_logs(
         &self,
         endpoint: &DockerEndpoint,

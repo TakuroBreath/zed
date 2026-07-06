@@ -57,6 +57,10 @@ pub enum DockerAction {
         project: String,
         service: Option<String>,
     },
+    ComposePullRedeploy {
+        project: String,
+        service: Option<String>,
+    },
 }
 
 impl DockerAction {
@@ -81,7 +85,8 @@ impl DockerAction {
             | DockerAction::RemoveImage { .. }
             | DockerAction::ComposeUp { .. }
             | DockerAction::ComposeDown { .. }
-            | DockerAction::ComposeRestart { .. } => true,
+            | DockerAction::ComposeRestart { .. }
+            | DockerAction::ComposePullRedeploy { .. } => true,
         }
     }
 
@@ -104,6 +109,14 @@ impl DockerAction {
             DockerAction::ComposeRestart { project, service } => match service {
                 Some(service) => format!("docker compose -p {project} restart {service}"),
                 None => format!("docker compose -p {project} restart"),
+            },
+            DockerAction::ComposePullRedeploy { project, service } => match service {
+                Some(service) => format!(
+                    "docker compose -p {project} pull {service} && docker compose -p {project} up -d {service}"
+                ),
+                None => {
+                    format!("docker compose -p {project} pull && docker compose -p {project} up -d")
+                }
             },
         }
     }
@@ -580,6 +593,11 @@ impl DockerEndpointStore {
                         .compose_restart(&endpoint, &project, service.as_deref())
                         .await
                 }
+                DockerAction::ComposePullRedeploy { project, service } => {
+                    client
+                        .compose_pull_and_redeploy(&endpoint, &project, service.as_deref())
+                        .await
+                }
             }
         });
 
@@ -671,6 +689,25 @@ impl DockerEndpointStore {
         self.dispatch_action(
             endpoint_name,
             DockerAction::ComposeRestart { project, service },
+            cx,
+        );
+    }
+
+    /// Pulls the latest image(s) for `project` (optionally scoped to
+    /// `service`) and recreates its containers on `endpoint_name`, so the new
+    /// image actually takes effect (unlike `compose_restart`, which reuses
+    /// the existing image). Destructive: blocked on read-only endpoints by
+    /// [`Self::dispatch_action`].
+    pub fn compose_pull_redeploy(
+        &mut self,
+        endpoint_name: &str,
+        project: String,
+        service: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.dispatch_action(
+            endpoint_name,
+            DockerAction::ComposePullRedeploy { project, service },
             cx,
         );
     }
@@ -856,6 +893,13 @@ mod tests {
             }
             .is_destructive()
         );
+        assert!(
+            DockerAction::ComposePullRedeploy {
+                project: "a".into(),
+                service: None
+            }
+            .is_destructive()
+        );
     }
 
     #[test]
@@ -878,6 +922,22 @@ mod tests {
             }
             .command_string(),
             "docker compose -p shop up -d web"
+        );
+        assert_eq!(
+            DockerAction::ComposePullRedeploy {
+                project: "shop".into(),
+                service: None
+            }
+            .command_string(),
+            "docker compose -p shop pull && docker compose -p shop up -d"
+        );
+        assert_eq!(
+            DockerAction::ComposePullRedeploy {
+                project: "shop".into(),
+                service: Some("web".into())
+            }
+            .command_string(),
+            "docker compose -p shop pull web && docker compose -p shop up -d web"
         );
     }
 
@@ -1227,6 +1287,10 @@ mod tests {
                 project: "shop".into(),
             },
             DockerAction::ComposeRestart {
+                project: "shop".into(),
+                service: None,
+            },
+            DockerAction::ComposePullRedeploy {
                 project: "shop".into(),
                 service: None,
             },
