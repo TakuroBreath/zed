@@ -341,23 +341,42 @@ impl DockerPanel {
     fn toggle_node(&mut self, node: TreeNodeId, cx: &mut Context<Self>) {
         if self.expanded.remove(&node) {
             cx.notify();
+            self.sync_active_endpoints(cx);
             return;
         }
         self.expanded.insert(node.clone());
 
-        // Trigger lazy loading for the newly-expanded node.
+        // Refresh the newly-expanded endpoint so reopening it shows current
+        // data rather than whatever was last cached: with lazy autopoll, a
+        // collapsed endpoint stops refreshing in the background, so it may
+        // be stale (or, with polling disabled, never fetched at all).
         if let TreeNodeId::Endpoint(endpoint) = &node {
-            let needs_refresh = self.store.read(cx).endpoints().iter().any(|state| {
-                &state.endpoint.name == endpoint
-                    && state.containers.is_none()
-                    && state.status != EndpointStatus::Connecting
+            let should_refresh = self.store.read(cx).endpoints().iter().any(|state| {
+                &state.endpoint.name == endpoint && state.status != EndpointStatus::Connecting
             });
-            if needs_refresh {
+            if should_refresh {
                 self.store
                     .update(cx, |store, cx| store.refresh(endpoint, cx));
             }
         }
         cx.notify();
+        self.sync_active_endpoints(cx);
+    }
+
+    /// Pushes the set of currently-expanded `Endpoint` nodes to the store, so
+    /// autopoll refreshes only the endpoints the user has open. Category
+    /// nodes (Containers/Images/Compose) don't affect polling.
+    fn sync_active_endpoints(&self, cx: &mut Context<Self>) {
+        let names: HashSet<String> = self
+            .expanded
+            .iter()
+            .filter_map(|node| match node {
+                TreeNodeId::Endpoint(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        self.store
+            .update(cx, |store, _| store.set_active_endpoints(names));
     }
 
     /// Refreshes the currently selected endpoint if there is a selection,
@@ -1731,5 +1750,38 @@ mod tests {
             })
         })
         .await;
+    }
+
+    #[gpui::test]
+    fn toggling_endpoint_node_updates_store_active_set(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fake = Arc::new(FakeDockerClient::new());
+        let factory = Arc::new(move || fake.clone() as Arc<dyn DockerClient>);
+        let store = cx.new(|cx| DockerEndpointStore::new(factory, cx));
+        let panel = cx.new(|cx| DockerPanel::new_for_test(store.clone(), cx));
+
+        let endpoint_name =
+            store.read_with(cx, |store, _| store.endpoints()[0].endpoint.name.clone());
+
+        panel.update(cx, |panel, cx| {
+            panel.toggle_node(TreeNodeId::Endpoint(endpoint_name.clone()), cx);
+        });
+        store.read_with(cx, |store, _| {
+            assert!(
+                store.active_endpoints_for_test().contains(&endpoint_name),
+                "expanding an endpoint should mark it active"
+            );
+        });
+
+        panel.update(cx, |panel, cx| {
+            panel.toggle_node(TreeNodeId::Endpoint(endpoint_name.clone()), cx);
+        });
+        store.read_with(cx, |store, _| {
+            assert!(
+                !store.active_endpoints_for_test().contains(&endpoint_name),
+                "collapsing an endpoint should mark it inactive"
+            );
+        });
     }
 }

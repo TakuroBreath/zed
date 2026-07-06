@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -183,6 +183,9 @@ pub struct DockerEndpointStore {
     /// Tracks the last time each named endpoint was polled, so remote (`Ssh`)
     /// endpoints can be throttled independently of the configured interval.
     last_polled: HashMap<String, Instant>,
+    /// Endpoint names the panel currently has expanded in the tree. Autopoll
+    /// only refreshes endpoints in this set; see [`Self::poll_all_due`].
+    active_endpoints: HashSet<String>,
     _settings_subscription: gpui::Subscription,
     _poll_task: Task<()>,
 }
@@ -211,6 +214,7 @@ impl DockerEndpointStore {
             endpoints,
             client_factory,
             last_polled: HashMap::new(),
+            active_endpoints: HashSet::new(),
             _settings_subscription: settings_subscription,
             _poll_task: poll_task,
         };
@@ -722,7 +726,9 @@ impl DockerEndpointStore {
     /// sleep without restarting the app. Remote (`Ssh`) endpoints are polled
     /// at most every `max(interval, MIN_REMOTE_POLL_INTERVAL)`: endpoints not
     /// yet due are skipped for that tick via `poll_all_due`, rather than
-    /// blocking the whole loop's cadence.
+    /// blocking the whole loop's cadence. Autopoll only refreshes endpoints
+    /// the panel has marked active (i.e. currently expanded in the tree);
+    /// see [`Self::set_active_endpoints`].
     ///
     /// `poll_interval_seconds == 0` means manual-only: the loop sleeps
     /// `DISABLED_POLL_RECHECK_INTERVAL` and re-checks the setting without
@@ -756,14 +762,18 @@ impl DockerEndpointStore {
         })
     }
 
-    /// Refreshes every non-`Error`, non-`Connecting` endpoint that is due:
-    /// local endpoints every tick, remote (`Ssh`) endpoints at most every
-    /// `max(interval, MIN_REMOTE_POLL_INTERVAL)`.
+    /// Refreshes every active (currently expanded), non-`Error`,
+    /// non-`Connecting` endpoint that is due: local endpoints every tick,
+    /// remote (`Ssh`) endpoints at most every
+    /// `max(interval, MIN_REMOTE_POLL_INTERVAL)`. Endpoints the panel hasn't
+    /// marked active via [`Self::set_active_endpoints`] are never
+    /// auto-refreshed, no matter how long they've gone without a poll.
     fn poll_all_due(&mut self, interval: Duration, now: Instant, cx: &mut Context<Self>) {
         let remote_interval = interval.max(MIN_REMOTE_POLL_INTERVAL);
         let names: Vec<String> = self
             .endpoints
             .iter()
+            .filter(|state| self.active_endpoints.contains(&state.endpoint.name))
             .filter(|state| {
                 !matches!(
                     state.status,
@@ -789,6 +799,19 @@ impl DockerEndpointStore {
         for name in names {
             self.refresh(&name, cx);
         }
+    }
+
+    /// Replaces the set of endpoint names autopoll is allowed to refresh.
+    /// Called by the panel whenever its tree-expansion state changes, so
+    /// autopoll tracks which endpoints the user is currently looking at.
+    /// Doesn't affect rendering, so no `cx.notify()` is needed.
+    pub fn set_active_endpoints(&mut self, names: HashSet<String>) {
+        self.active_endpoints = names;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_endpoints_for_test(&self) -> &HashSet<String> {
+        &self.active_endpoints
     }
 }
 
@@ -1065,7 +1088,10 @@ mod tests {
         let fake = Arc::new(FakeDockerClient::new()); // records calls
         let recorder = fake.clone();
         let factory: ClientFactory = Arc::new(move || recorder.clone() as Arc<dyn DockerClient>);
-        let _store = cx.new(|cx| DockerEndpointStore::new(factory, cx));
+        let store = cx.new(|cx| DockerEndpointStore::new(factory, cx));
+        store.update(cx, |s, _| {
+            s.set_active_endpoints(HashSet::from(["local".to_string()]))
+        });
         let before = fake
             .calls()
             .iter()
@@ -1093,6 +1119,44 @@ mod tests {
         assert!(
             after > before,
             "autopoll should have refreshed at least once"
+        );
+    }
+
+    #[gpui::test]
+    async fn autopoll_skips_inactive_endpoints(cx: &mut TestAppContext) {
+        init_test(cx);
+        set_poll_interval_seconds(cx, 5);
+        cx.executor().allow_parking();
+        set_one_ssh_endpoint(cx); // configures "prod" as read_only: true, ssh deploy@1.2.3.4
+        let fake = Arc::new(FakeDockerClient::new()); // records calls
+        let recorder = fake.clone();
+        let factory: ClientFactory = Arc::new(move || recorder.clone() as Arc<dyn DockerClient>);
+        let store = cx.new(|cx| DockerEndpointStore::new(factory, cx));
+        store.update(cx, |s, _| {
+            s.set_active_endpoints(HashSet::from(["local".to_string()]))
+        });
+        let before = fake
+            .calls()
+            .iter()
+            .filter(|c| c.starts_with("list_containers"))
+            .count();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(20));
+        wait_until(cx, |_| {
+            fake.calls()
+                .iter()
+                .filter(|c| c.starts_with("list_containers local"))
+                .count()
+                > before
+        })
+        .await;
+
+        assert!(
+            !fake
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("list_containers prod")),
+            "inactive endpoint `prod` must not be auto-refreshed"
         );
     }
 
