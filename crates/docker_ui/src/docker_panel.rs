@@ -1753,8 +1753,12 @@ mod tests {
     }
 
     #[gpui::test]
-    fn toggling_endpoint_node_updates_store_active_set(cx: &mut TestAppContext) {
+    async fn toggling_endpoint_node_updates_store_active_set(cx: &mut TestAppContext) {
         init_test(cx);
+        // Expanding an endpoint triggers an async `refresh`; allow parking so
+        // that spawned work can be drained deterministically below instead of
+        // dangling into teardown (which flakes under parallel test runs).
+        cx.executor().allow_parking();
 
         let fake = Arc::new(FakeDockerClient::new());
         let factory = Arc::new(move || fake.clone() as Arc<dyn DockerClient>);
@@ -1774,6 +1778,19 @@ mod tests {
             );
         });
 
+        // Drain the refresh the expand spawned so it finishes cleanly (the
+        // endpoint leaves `Connecting`) before the test ends.
+        wait_until(cx, |cx| {
+            store.read_with(cx, |store, _| {
+                store
+                    .endpoints()
+                    .iter()
+                    .find(|state| state.endpoint.name == endpoint_name)
+                    .map_or(false, |state| state.status != EndpointStatus::Connecting)
+            })
+        })
+        .await;
+
         panel.update(cx, |panel, cx| {
             panel.toggle_node(TreeNodeId::Endpoint(endpoint_name.clone()), cx);
         });
@@ -1783,5 +1800,6 @@ mod tests {
                 "collapsing an endpoint should mark it inactive"
             );
         });
+        cx.run_until_parked();
     }
 }
