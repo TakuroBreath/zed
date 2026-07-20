@@ -1105,6 +1105,13 @@
     },
   },
   {
+    "context": "DatabaseValueViewer > Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "escape": "menu::Cancel",
+    },
+  },
+  {
     // While a debug session is live, debugger controls take over their F-keys.
     // `f6` becomes Pause (region navigation stays on `ctrl-f6` / `shift-f6`),
     // and step/stop/rerun are scoped here so they're inert when not debugging.

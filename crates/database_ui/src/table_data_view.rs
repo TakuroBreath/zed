@@ -28,6 +28,7 @@ use crate::DatabaseSettings;
 use crate::UI_MAX_QUERY_ROWS;
 use crate::query_state::{QueryBase, QueryState, render_sql};
 use crate::sql_query_view::RunQuery;
+use crate::value_viewer::{ValueViewer, ValueViewerEvent, ValueViewerParams};
 
 actions!(
     database,
@@ -201,6 +202,17 @@ pub struct EditingCell {
     pub original: Option<String>,
     /// The live text input.
     pub field: Entity<InputField>,
+}
+
+/// Состояние открытого окна значения: сам viewer плюс цель записи. Цель
+/// захватывается при открытии по стабильному ключу (`RowKey`/`InsertId`), а не
+/// по позиции на экране, поэтому Apply ложится в нужную строку, даже если
+/// отображение сменилось (тот же принцип, что у инлайн-редактора).
+struct ValueViewerState {
+    viewer: Entity<ValueViewer>,
+    target: Option<EditTarget>,
+    column: String,
+    _subscription: Subscription,
 }
 
 /// Buffers pending row edits before they are applied to the database as one
@@ -403,9 +415,11 @@ pub struct TableDataView {
     /// position it opened at. The `Subscription` watches the menu's
     /// `DismissEvent` to clear this field; dropping the tuple drops both.
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
-    /// The "View value" popup deployed from the cell context menu, anchored
-    /// at the cursor position the menu opened at.
-    value_popover: Option<(Entity<ValuePopover>, Point<Pixels>, Subscription)>,
+    /// Открытое окно просмотра/редактирования значения ячейки, вместе с целью
+    /// записи, захваченной при открытии (см. `open_value_viewer`).
+    value_viewer: Option<ValueViewerState>,
+    /// Нужен окну значения для подсветки JSON; `None` в тестах.
+    language_registry: Option<Arc<LanguageRegistry>>,
     /// Held separately from `_structure_task` so a structure load and a data
     /// reload can be in flight at the same time without one aborting the other.
     _data_task: Option<Task<()>>,
@@ -455,7 +469,7 @@ impl TableDataView {
                 editor.set_show_gutter(false, cx);
                 editor
             });
-            if let Some(language_registry) = language_registry {
+            if let Some(language_registry) = language_registry.clone() {
                 cx.spawn(async move |this, cx| {
                     let sql = language_registry.language_for_name("SQL").await.ok();
                     if sql.is_none() {
@@ -524,7 +538,8 @@ impl TableDataView {
                 column_widths: None,
                 last_run: None,
                 context_menu: None,
-                value_popover: None,
+                value_viewer: None,
+                language_registry,
                 _data_task: None,
                 _structure_task: None,
                 _save_task: None,
@@ -576,12 +591,16 @@ impl TableDataView {
         self.context_menu.is_some()
     }
 
-    /// Test-only: exposes the "View value" popover's current text, if open.
+    /// Test-only: открыто ли окно значения.
     #[cfg(test)]
-    fn value_popover_text(&self, cx: &App) -> Option<SharedString> {
-        self.value_popover
-            .as_ref()
-            .map(|(popover, _, _)| popover.read(cx).value.clone())
+    fn value_viewer_open(&self) -> bool {
+        self.value_viewer.is_some()
+    }
+
+    /// Test-only: entity открытого окна значения.
+    #[cfg(test)]
+    fn value_viewer(&self) -> Option<&Entity<ValueViewer>> {
+        self.value_viewer.as_ref().map(|state| &state.viewer)
     }
 
     pub fn structure(&self) -> Option<&TableStructure> {
@@ -2135,11 +2154,20 @@ impl TableDataView {
             };
             menu = menu.separator().entry("View value", None, {
                 let table_view = table_view.clone();
-                let popover_value = value.clone().unwrap_or_else(|| "NULL".to_string());
+                let column = column.clone();
+                let value = value.clone();
+                let target = target.clone();
                 move |window, cx| {
                     table_view
                         .update(cx, |table, cx| {
-                            table.open_value_popover(position, popover_value.clone(), window, cx);
+                            table.open_value_viewer(
+                                column.clone(),
+                                value.clone(),
+                                target.clone(),
+                                None,
+                                window,
+                                cx,
+                            );
                         })
                         .log_err();
                 }
@@ -2222,27 +2250,104 @@ impl TableDataView {
         page.columns.iter().position(|name| name == column)
     }
 
-    /// Opens the "View value" popup at `position`, showing `value` in full
-    /// (already resolved to the literal text `"NULL"` by the caller when the
-    /// cell was NULL).
-    fn open_value_popover(
+    /// Тип колонки объявлен как json/jsonb. Только в табличном режиме: в
+    /// кастомном запросе колонки результата не совпадают со структурой таблицы.
+    fn column_is_json(&self, column: &str) -> bool {
+        matches!(self.query.base, QueryBase::Table(_))
+            && self.structure.as_ref().is_some_and(|structure| {
+                structure.columns.iter().any(|info| {
+                    info.name == column && matches!(info.udt_name.as_str(), "json" | "jsonb")
+                })
+            })
+    }
+
+    fn column_type_label(&self, column: &str) -> Option<String> {
+        if !matches!(self.query.base, QueryBase::Table(_)) {
+            return None;
+        }
+        let structure = self.structure.as_ref()?;
+        structure
+            .columns
+            .iter()
+            .find(|info| info.name == column)
+            .map(|info| info.data_type.clone())
+    }
+
+    /// Открывает окно просмотра/редактирования значения ячейки. `value` — текущее
+    /// отображаемое значение (`None` — NULL), `initial_text` — правка,
+    /// перенесённая из инлайн-редактора. Окно read-only, когда записать некуда
+    /// или нельзя: нет цели, вью нередактируемо, или колонка — часть первичного
+    /// ключа.
+    pub fn open_value_viewer(
         &mut self,
-        position: Point<Pixels>,
-        value: String,
+        column: String,
+        value: Option<String>,
+        target: Option<EditTarget>,
+        initial_text: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let popover = cx.new(|cx| ValuePopover {
-            value: value.into(),
-            focus_handle: cx.focus_handle(),
-        });
-        window.focus(&popover.focus_handle(cx), cx);
-        let subscription = cx.subscribe(&popover, |this, _, _: &DismissEvent, cx| {
-            this.value_popover.take();
+        let read_only =
+            !self.editable() || target.is_none() || self.is_primary_key_column(&column);
+        let params = ValueViewerParams {
+            column: column.clone(),
+            column_type: self.column_type_label(&column),
+            original: value,
+            initial_text,
+            declared_json: self.column_is_json(&column),
+            read_only,
+        };
+        let language_registry = self.language_registry.clone();
+        let viewer = cx.new(|cx| ValueViewer::new(params, language_registry, window, cx));
+        window.focus(&viewer.focus_handle(cx), cx);
+        let subscription = cx.subscribe(&viewer, |this, _, event: &ValueViewerEvent, cx| {
+            let Some(state) = this.value_viewer.take() else {
+                return;
+            };
+            match event {
+                ValueViewerEvent::Apply(text) => {
+                    this.apply_viewer_value(state.target, &state.column, Some(text.clone()), cx);
+                }
+                ValueViewerEvent::SetNull => {
+                    this.apply_viewer_value(state.target, &state.column, None, cx);
+                }
+                ValueViewerEvent::Dismissed => {}
+            }
             cx.notify();
         });
-        self.value_popover = Some((popover, position, subscription));
+        self.value_viewer = Some(ValueViewerState {
+            viewer,
+            target,
+            column,
+            _subscription: subscription,
+        });
         cx.notify();
+    }
+
+    /// Кладёт значение (или NULL) из окна значения в буфер правок. Та же
+    /// защита, что у `commit_cell_edit_inner`: если редактирование стало
+    /// недоступно, пока окно было открыто, ничего не записываем.
+    fn apply_viewer_value(
+        &mut self,
+        target: Option<EditTarget>,
+        column: &str,
+        value: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.editable() || self.is_saving() {
+            return;
+        }
+        let Some(target) = target else {
+            return;
+        };
+        match (target, value) {
+            (EditTarget::Existing(row_key), Some(value)) => {
+                self.set_cell_value(row_key, column, value, cx)
+            }
+            (EditTarget::Existing(row_key), None) => self.set_cell_null(row_key, column, cx),
+            (EditTarget::New(id), Some(value)) => self.set_new_cell_value(id, column, value, cx),
+            (EditTarget::New(id), None) => self.set_new_cell_null(id, column, cx),
+        }
     }
 
     /// Renders one data cell of an existing row, honouring the inline editor and
@@ -3303,51 +3408,6 @@ impl Render for FilterPopover {
     }
 }
 
-/// A read-only popup showing a data cell's full value, opened from the cell
-/// context menu's "View value" entry. Values in the grid are truncated for
-/// display and menu labels are truncated further; this is the one place the
-/// whole value is shown.
-pub struct ValuePopover {
-    value: SharedString,
-    focus_handle: FocusHandle,
-}
-
-impl EventEmitter<DismissEvent> for ValuePopover {}
-
-impl Focusable for ValuePopover {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
-
-impl Render for ValuePopover {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
-            .key_context("DatabaseValuePopover")
-            .track_focus(&self.focus_handle)
-            .occlude()
-            .elevation_2(cx)
-            .max_w_96()
-            .max_h_80()
-            .p_2()
-            .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
-            .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(DismissEvent)))
-            .child(
-                div()
-                    .id("db-value-scroll")
-                    .overflow_y_scroll()
-                    .max_h_72()
-                    .child(
-                        div()
-                            .font_buffer(cx)
-                            .text_ui_sm(cx)
-                            .whitespace_normal()
-                            .child(self.value.clone()),
-                    ),
-            )
-    }
-}
-
 impl Render for TableDataView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = match (&self.load_state, self.mode) {
@@ -3426,16 +3486,19 @@ impl Render for TableDataView {
                 )
                 .with_priority(3)
             }))
-            .children(self.value_popover.as_ref().map(|(popover, position, _)| {
-                deferred(
-                    anchored()
-                        .position(*position)
-                        .anchor(Anchor::TopLeft)
-                        .snap_to_window_with_margin(px(8.))
-                        .child(popover.clone()),
-                )
-                .with_priority(3)
-            }))
+            .when_some(self.value_viewer.as_ref(), |this, state| {
+                this.child(deferred(
+                    div()
+                        .occlude()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(gpui::black().opacity(0.4))
+                        .child(state.viewer.clone()),
+                ))
+            })
     }
 }
 
@@ -6762,35 +6825,247 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn view_value_populates_popover_with_full_text(cx: &mut TestAppContext) {
+    async fn view_value_opens_viewer_with_pretty_json(cx: &mut TestAppContext) {
         let cx = &mut cx.clone();
         let (_fake, view, cx) = view_with_default_rows(cx).await;
 
-        let long_value = "x".repeat(200);
+        let key = RowKey {
+            columns: vec!["id".into()],
+            values: vec![Some("1".into())],
+        };
         view.update_in(cx, |view, window, cx| {
-            view.open_value_popover(gpui::Point::default(), long_value.clone(), window, cx);
-        });
-
-        view.read_with(cx, |view, cx| {
-            assert_eq!(
-                view.value_popover_text(cx).as_deref(),
-                Some(long_value.as_str()),
-                "the popover should hold the full, untruncated value"
+            view.open_value_viewer(
+                "name".into(),
+                Some(r#"{"a":1}"#.into()),
+                Some(EditTarget::Existing(key)),
+                None,
+                window,
+                cx,
             );
+        });
+        view.read_with(cx, |view, cx| {
+            assert!(view.value_viewer_open());
+            let viewer = view.value_viewer().expect("viewer should be open");
+            assert_eq!(viewer.read(cx).editor_text(cx), "{\n  \"a\": 1\n}");
+            assert!(!viewer.read(cx).read_only());
         });
     }
 
     #[gpui::test]
-    async fn view_value_shows_null_literal_for_null_cell(cx: &mut TestAppContext) {
+    async fn viewer_apply_buffers_update(cx: &mut TestAppContext) {
+        let cx = &mut cx.clone();
+        let (_fake, view, cx) = view_with_default_rows(cx).await;
+
+        let key = RowKey {
+            columns: vec!["id".into()],
+            values: vec![Some("1".into())],
+        };
+        view.update_in(cx, |view, window, cx| {
+            view.open_value_viewer(
+                "name".into(),
+                Some("Alice".into()),
+                Some(EditTarget::Existing(key.clone())),
+                None,
+                window,
+                cx,
+            );
+        });
+        let viewer = view
+            .read_with(cx, |view, _| view.value_viewer().cloned())
+            .expect("viewer should be open");
+        viewer.update_in(cx, |viewer, window, cx| {
+            viewer.set_editor_text("Alicia", window, cx);
+            viewer.apply(cx);
+        });
+        view.read_with(cx, |view, _| {
+            assert!(!view.value_viewer_open(), "apply closes the viewer");
+            let cell = view
+                .edits()
+                .updates()
+                .get(&key)
+                .and_then(|row| row.get("name"))
+                .expect("the applied value should be buffered");
+            assert_eq!(cell, &database_client::EditCell::Value("Alicia".into()));
+        });
+    }
+
+    #[gpui::test]
+    async fn viewer_apply_unchanged_closes_without_buffering(cx: &mut TestAppContext) {
+        let cx = &mut cx.clone();
+        let (_fake, view, cx) = view_with_default_rows(cx).await;
+
+        let key = RowKey {
+            columns: vec!["id".into()],
+            values: vec![Some("1".into())],
+        };
+        view.update_in(cx, |view, window, cx| {
+            view.open_value_viewer(
+                "name".into(),
+                Some("Alice".into()),
+                Some(EditTarget::Existing(key)),
+                None,
+                window,
+                cx,
+            );
+        });
+        let viewer = view
+            .read_with(cx, |view, _| view.value_viewer().cloned())
+            .expect("viewer should be open");
+        viewer.update(cx, |viewer, cx| viewer.apply(cx));
+        view.read_with(cx, |view, _| {
+            assert!(!view.value_viewer_open());
+            assert_eq!(view.pending_change_count(), 0, "unchanged apply must not buffer");
+        });
+    }
+
+    #[gpui::test]
+    async fn viewer_set_null_buffers_null(cx: &mut TestAppContext) {
+        let cx = &mut cx.clone();
+        let (_fake, view, cx) = view_with_default_rows(cx).await;
+
+        let key = RowKey {
+            columns: vec!["id".into()],
+            values: vec![Some("1".into())],
+        };
+        view.update_in(cx, |view, window, cx| {
+            view.open_value_viewer(
+                "name".into(),
+                Some("Alice".into()),
+                Some(EditTarget::Existing(key.clone())),
+                None,
+                window,
+                cx,
+            );
+        });
+        let viewer = view
+            .read_with(cx, |view, _| view.value_viewer().cloned())
+            .expect("viewer should be open");
+        viewer.update(cx, |_, cx| cx.emit(crate::value_viewer::ValueViewerEvent::SetNull));
+        view.read_with(cx, |view, _| {
+            assert!(!view.value_viewer_open());
+            let cell = view
+                .edits()
+                .updates()
+                .get(&key)
+                .and_then(|row| row.get("name"))
+                .expect("NULL should be buffered");
+            assert_eq!(cell, &database_client::EditCell::Null);
+        });
+    }
+
+    #[gpui::test]
+    async fn viewer_without_target_is_read_only(cx: &mut TestAppContext) {
         let cx = &mut cx.clone();
         let (_fake, view, cx) = view_with_default_rows(cx).await;
 
         view.update_in(cx, |view, window, cx| {
-            view.open_value_popover(gpui::Point::default(), "NULL".into(), window, cx);
+            view.open_value_viewer("name".into(), Some("Alice".into()), None, None, window, cx);
         });
-
         view.read_with(cx, |view, cx| {
-            assert_eq!(view.value_popover_text(cx).as_deref(), Some("NULL"));
+            let viewer = view.value_viewer().expect("viewer should be open");
+            assert!(viewer.read(cx).read_only());
+        });
+    }
+
+    #[gpui::test]
+    async fn viewer_on_primary_key_column_is_read_only(cx: &mut TestAppContext) {
+        let cx = &mut cx.clone();
+        let (_fake, view, cx) = view_with_default_rows(cx).await;
+
+        let key = RowKey {
+            columns: vec!["id".into()],
+            values: vec![Some("1".into())],
+        };
+        view.update_in(cx, |view, window, cx| {
+            view.open_value_viewer(
+                "id".into(),
+                Some("1".into()),
+                Some(EditTarget::Existing(key)),
+                None,
+                window,
+                cx,
+            );
+        });
+        view.read_with(cx, |view, cx| {
+            let viewer = view.value_viewer().expect("viewer should be open");
+            assert!(viewer.read(cx).read_only(), "PK identifies the row; editing it is forbidden");
+        });
+    }
+
+    #[gpui::test]
+    async fn viewer_null_cell_opens_empty(cx: &mut TestAppContext) {
+        let cx = &mut cx.clone();
+        let (_fake, view, cx) = view_with_default_rows(cx).await;
+
+        let key = RowKey {
+            columns: vec!["id".into()],
+            values: vec![Some("3".into())],
+        };
+        view.update_in(cx, |view, window, cx| {
+            view.open_value_viewer(
+                "name".into(),
+                None,
+                Some(EditTarget::Existing(key)),
+                None,
+                window,
+                cx,
+            );
+        });
+        view.read_with(cx, |view, cx| {
+            let viewer = view.value_viewer().expect("viewer should be open");
+            assert_eq!(viewer.read(cx).editor_text(cx), "");
+        });
+    }
+
+    #[gpui::test]
+    async fn viewer_detects_declared_json_column(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        let mut fake = FakeDatabaseClient::new();
+        fake.query_result = default_rows_result();
+        if let Some(name_column) = fake
+            .structure
+            .columns
+            .iter_mut()
+            .find(|column| column.name == "name")
+        {
+            name_column.data_type = "jsonb".into();
+            name_column.udt_name = "jsonb".into();
+        }
+        let client: Arc<dyn DatabaseClient> = Arc::new(fake);
+
+        let cx = cx.add_empty_window();
+        let view = cx.update(|window, cx| {
+            TableDataView::new(client, "local".into(), table_ref(), false, None, window, cx)
+        });
+        wait_until(cx, |cx| {
+            view.read_with(cx, |view, _| {
+                view.page().is_some() && view.structure().is_some()
+            })
+        })
+        .await;
+
+        let key = RowKey {
+            columns: vec!["id".into()],
+            values: vec![Some("1".into())],
+        };
+        view.update_in(cx, |view, window, cx| {
+            view.open_value_viewer(
+                "name".into(),
+                Some("{broken".into()),
+                Some(EditTarget::Existing(key)),
+                None,
+                window,
+                cx,
+            );
+        });
+        view.read_with(cx, |view, cx| {
+            let viewer = view.value_viewer().expect("viewer should be open");
+            assert!(
+                viewer.read(cx).is_json(),
+                "a declared jsonb column gets JSON affordances even for invalid content"
+            );
+            assert!(viewer.read(cx).json_error().is_some());
         });
     }
 
@@ -6946,36 +7221,6 @@ mod tests {
             assert!(
                 !view.context_menu_open(),
                 "DismissEvent should clear the context_menu field"
-            );
-        });
-    }
-
-    #[gpui::test]
-    async fn dismiss_event_clears_value_popover(cx: &mut TestAppContext) {
-        let cx = &mut cx.clone();
-        let (_fake, view, cx) = view_with_default_rows(cx).await;
-
-        view.update_in(cx, |view, window, cx| {
-            view.open_value_popover(gpui::Point::default(), "Alice".into(), window, cx);
-        });
-        view.read_with(cx, |view, cx| {
-            assert!(view.value_popover_text(cx).is_some());
-        });
-
-        let popover = view.read_with(cx, |view, _| {
-            view.value_popover
-                .as_ref()
-                .expect("popover should be set")
-                .0
-                .clone()
-        });
-        popover.update(cx, |_, cx| cx.emit(DismissEvent));
-        cx.run_until_parked();
-
-        view.read_with(cx, |view, cx| {
-            assert!(
-                view.value_popover_text(cx).is_none(),
-                "DismissEvent should clear the value_popover field"
             );
         });
     }
@@ -7841,32 +8086,6 @@ mod tests {
             cx.debug_bounds("db-sql-bar-custom-indicator").is_some(),
             "a dirty, unrun SQL bar must still surface the custom/read-only indicator when collapsed"
         );
-    }
-
-    #[gpui::test]
-    async fn value_popover_renders_without_panicking(cx: &mut TestAppContext) {
-        // Finding 9: smoke-test that switching the popover's value text to a
-        // monospaced container doesn't break rendering, including for a long
-        // value that must wrap.
-        let cx = &mut cx.clone();
-        let (_fake, view, cx) = view_with_default_rows(cx).await;
-
-        let long_value = "x".repeat(400);
-        view.update_in(cx, |view, window, cx| {
-            view.open_value_popover(gpui::Point::default(), long_value, window, cx);
-        });
-
-        let popover = view.read_with(cx, |view, _| {
-            view.value_popover
-                .as_ref()
-                .expect("popover should be set")
-                .0
-                .clone()
-        });
-        cx.draw(point(px(0.), px(0.)), size(px(400.), px(400.)), |_, _| {
-            popover.clone().into_any_element()
-        });
-        cx.run_until_parked();
     }
 
     #[gpui::test]

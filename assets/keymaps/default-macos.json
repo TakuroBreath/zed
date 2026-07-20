@@ -1139,6 +1139,12 @@
     },
   },
   {
+    "context": "DatabaseValueViewer > Editor",
+    "bindings": {
+      "escape": "menu::Cancel",
+    },
+  },
+  {
     "context": "GitPanel",
     "use_key_equivalents": true,
     "bindings": {
