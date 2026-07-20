@@ -5,6 +5,7 @@ mod database_settings;
 pub(crate) mod query_state;
 mod sql_query_view;
 mod table_data_view;
+pub mod value_viewer;
 
 pub use connection_modal::ConnectionModal;
 pub use connection_store::*;

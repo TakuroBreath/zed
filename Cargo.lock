@@ -5027,6 +5027,7 @@ dependencies = [
  "log",
  "menu",
  "multi_buffer",
+ "serde_json",
  "settings",
  "theme",
  "theme_settings",
