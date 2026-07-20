@@ -2319,21 +2319,33 @@ impl TableDataView {
         let language_registry = self.language_registry.clone();
         let viewer = cx.new(|cx| ValueViewer::new(params, language_registry, window, cx));
         window.focus(&viewer.focus_handle(cx), cx);
-        let subscription = cx.subscribe(&viewer, |this, _, event: &ValueViewerEvent, cx| {
-            let Some(state) = this.value_viewer.take() else {
-                return;
-            };
-            match event {
-                ValueViewerEvent::Apply(text) => {
-                    this.apply_viewer_value(state.target, &state.column, Some(text.clone()), cx);
+        let subscription = cx.subscribe_in(
+            &viewer,
+            window,
+            |this, _, event: &ValueViewerEvent, window, cx| {
+                let Some(state) = this.value_viewer.take() else {
+                    return;
+                };
+                match event {
+                    ValueViewerEvent::Apply(text) => {
+                        this.apply_viewer_value(
+                            state.target,
+                            &state.column,
+                            Some(text.clone()),
+                            cx,
+                        );
+                    }
+                    ValueViewerEvent::SetNull => {
+                        this.apply_viewer_value(state.target, &state.column, None, cx);
+                    }
+                    ValueViewerEvent::Dismissed => {}
                 }
-                ValueViewerEvent::SetNull => {
-                    this.apply_viewer_value(state.target, &state.column, None, cx);
-                }
-                ValueViewerEvent::Dismissed => {}
-            }
-            cx.notify();
-        });
+                // Окно значения держало фокус окна; после закрытия возвращаем его
+                // гриду, иначе ввод с клавиатуры «мёртв» до следующего клика.
+                window.focus(&this.focus_handle, cx);
+                cx.notify();
+            },
+        );
         self.value_viewer = Some(ValueViewerState {
             viewer,
             target,
@@ -3633,9 +3645,9 @@ mod tests {
         ColumnInfo, DatabaseClient, Filter, FilterOp, QueryResult, RowKey, SortDirection, TableRef,
     };
     use gpui::{
-        AppContext as _, ClickEvent, DismissEvent, Entity, Focusable, IntoElement, MouseButton,
-        MouseClickEvent, MouseDownEvent, MouseUpEvent, TestAppContext, UpdateGlobal as _,
-        VisualTestContext, point, px, size,
+        AppContext as _, ClickEvent, Context, DismissEvent, Entity, Focusable, IntoElement,
+        MouseButton, MouseClickEvent, MouseDownEvent, MouseUpEvent, Render, TestAppContext,
+        UpdateGlobal as _, VisualTestContext, Window, point, px, size,
     };
 
     use super::{
@@ -5447,7 +5459,10 @@ mod tests {
         });
 
         view.read_with(cx, |view, cx| {
-            assert!(view.editing_cell().is_none(), "expand closes the inline editor");
+            assert!(
+                view.editing_cell().is_none(),
+                "expand closes the inline editor"
+            );
             assert_eq!(view.pending_change_count(), 0, "expand must not commit");
             let viewer = view.value_viewer().expect("expand opens the viewer");
             assert_eq!(viewer.read(cx).editor_text(cx), "Alicia-in-progress");
@@ -7053,7 +7068,11 @@ mod tests {
         viewer.update(cx, |viewer, cx| viewer.apply(cx));
         view.read_with(cx, |view, _| {
             assert!(!view.value_viewer_open());
-            assert_eq!(view.pending_change_count(), 0, "unchanged apply must not buffer");
+            assert_eq!(
+                view.pending_change_count(),
+                0,
+                "unchanged apply must not buffer"
+            );
         });
     }
 
@@ -7079,7 +7098,9 @@ mod tests {
         let viewer = view
             .read_with(cx, |view, _| view.value_viewer().cloned())
             .expect("viewer should be open");
-        viewer.update(cx, |_, cx| cx.emit(crate::value_viewer::ValueViewerEvent::SetNull));
+        viewer.update(cx, |_, cx| {
+            cx.emit(crate::value_viewer::ValueViewerEvent::SetNull)
+        });
         view.read_with(cx, |view, _| {
             assert!(!view.value_viewer_open());
             let cell = view
@@ -8252,5 +8273,61 @@ mod tests {
             view.clone().into_any_element()
         });
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn value_viewer_overlay_renders_without_panicking(cx: &mut TestAppContext) {
+        // Exercises the deferred `.when_some(self.value_viewer...)` overlay branch
+        // and the viewer's relative-sized `render` under a real layout pass. The
+        // window is rooted at the view (via a thin wrapper, since
+        // `TableDataView::new` already returns an `Entity`) so the full window
+        // draw cycle flushes the deferred overlay; a throwaway `cx.draw` would
+        // leave that deferred draw dangling and panic on the next redraw.
+        struct Root(Entity<TableDataView>);
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.0.clone()
+            }
+        }
+
+        let cx = &mut cx.clone();
+        init_test(cx);
+        cx.executor().allow_parking();
+        let fake = fake_with_default_rows();
+        let client: Arc<dyn DatabaseClient> = fake.clone();
+
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root(TableDataView::new(
+                client,
+                "local".into(),
+                table_ref(),
+                false,
+                None,
+                window,
+                cx,
+            ))
+        });
+        let view = root.read_with(cx, |root, _| root.0.clone());
+        wait_until(cx, |cx| {
+            view.read_with(cx, |view, _| {
+                view.page().is_some() && view.structure().is_some()
+            })
+        })
+        .await;
+
+        view.update_in(cx, |view, window, cx| {
+            view.open_value_viewer(
+                "name".into(),
+                Some(r#"{"a":1}"#.into()),
+                None,
+                None,
+                window,
+                cx,
+            );
+        });
+        // Opening the viewer dirties the window; the flush here draws the view
+        // and its deferred overlay through the real window draw cycle.
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(view.value_viewer_open()));
     }
 }
