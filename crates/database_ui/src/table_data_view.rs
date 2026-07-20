@@ -1116,6 +1116,25 @@ impl TableDataView {
         }
     }
 
+    /// Переносит открытый инлайн-редактор в большое окно значения: текст поля
+    /// (возможно, уже изменённый) становится стартовым текстом окна, инлайн
+    /// закрывается без коммита — базой «без изменений» остаётся исходное
+    /// значение ячейки, так что перенесённая правка не потеряется при Apply.
+    pub fn expand_editing_cell(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editing) = self.editing_cell.take() else {
+            return;
+        };
+        let text = editing.field.read(cx).text(cx);
+        self.open_value_viewer(
+            editing.column,
+            editing.original,
+            Some(editing.target),
+            Some(text),
+            window,
+            cx,
+        );
+    }
+
     /// Whether the inline cell editor's own text field currently holds focus.
     /// Used to gate Enter/Escape (`menu::Confirm`/`menu::Cancel`) so they only
     /// commit or cancel the cell edit when the user is typing in that field, not
@@ -2478,6 +2497,14 @@ impl TableDataView {
             .gap_1()
             .items_center()
             .child(div().flex_1().child(field))
+            .child(
+                IconButton::new("db-cell-expand", IconName::Maximize)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Open in value editor"))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.expand_editing_cell(window, cx)),
+                    ),
+            )
             .child(
                 Button::new("db-cell-null", "∅ NULL")
                     .size(ButtonSize::Compact)
@@ -5390,6 +5417,118 @@ mod tests {
                 .and_then(|row| row.get("name"))
                 .expect("the committed update should be buffered for name");
             assert_eq!(cell, &database_client::EditCell::Value("Alicia".into()));
+        });
+    }
+
+    #[gpui::test]
+    async fn expand_transfers_inline_text_without_committing(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        let client: Arc<dyn DatabaseClient> = fake_with_default_rows();
+
+        let cx = cx.add_empty_window();
+        let view = cx.update(|window, cx| {
+            TableDataView::new(client, "local".into(), table_ref(), false, None, window, cx)
+        });
+        wait_until(cx, |cx| {
+            view.read_with(cx, |view, _| {
+                view.page().is_some() && view.structure().is_some()
+            })
+        })
+        .await;
+
+        view.update_in(cx, |view, window, cx| {
+            view.begin_edit_cell(0, 1, window, cx);
+            let editing = view.editing_cell().expect("edit should be in progress");
+            editing.field.update(cx, |field, cx| {
+                field.set_text("Alicia-in-progress", window, cx);
+            });
+            view.expand_editing_cell(window, cx);
+        });
+
+        view.read_with(cx, |view, cx| {
+            assert!(view.editing_cell().is_none(), "expand closes the inline editor");
+            assert_eq!(view.pending_change_count(), 0, "expand must not commit");
+            let viewer = view.value_viewer().expect("expand opens the viewer");
+            assert_eq!(viewer.read(cx).editor_text(cx), "Alicia-in-progress");
+            assert!(!viewer.read(cx).read_only());
+        });
+    }
+
+    #[gpui::test]
+    async fn expand_then_apply_buffers_the_edited_text(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        let client: Arc<dyn DatabaseClient> = fake_with_default_rows();
+
+        let cx = cx.add_empty_window();
+        let view = cx.update(|window, cx| {
+            TableDataView::new(client, "local".into(), table_ref(), false, None, window, cx)
+        });
+        wait_until(cx, |cx| {
+            view.read_with(cx, |view, _| {
+                view.page().is_some() && view.structure().is_some()
+            })
+        })
+        .await;
+
+        view.update_in(cx, |view, window, cx| {
+            view.begin_edit_cell(0, 1, window, cx);
+            let editing = view.editing_cell().expect("edit should be in progress");
+            editing.field.update(cx, |field, cx| {
+                field.set_text("Alicia", window, cx);
+            });
+            view.expand_editing_cell(window, cx);
+        });
+        let viewer = view
+            .read_with(cx, |view, _| view.value_viewer().cloned())
+            .expect("viewer should be open");
+        viewer.update(cx, |viewer, cx| viewer.apply(cx));
+
+        view.read_with(cx, |view, _| {
+            let key = RowKey {
+                columns: vec!["id".into()],
+                values: vec![Some("1".into())],
+            };
+            let cell = view
+                .edits()
+                .updates()
+                .get(&key)
+                .and_then(|row| row.get("name"))
+                .expect("the applied value should be buffered");
+            assert_eq!(cell, &database_client::EditCell::Value("Alicia".into()));
+        });
+    }
+
+    #[gpui::test]
+    async fn expand_unmodified_then_apply_buffers_nothing(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        let client: Arc<dyn DatabaseClient> = fake_with_default_rows();
+
+        let cx = cx.add_empty_window();
+        let view = cx.update(|window, cx| {
+            TableDataView::new(client, "local".into(), table_ref(), false, None, window, cx)
+        });
+        wait_until(cx, |cx| {
+            view.read_with(cx, |view, _| {
+                view.page().is_some() && view.structure().is_some()
+            })
+        })
+        .await;
+
+        view.update_in(cx, |view, window, cx| {
+            view.begin_edit_cell(0, 1, window, cx);
+            view.expand_editing_cell(window, cx);
+        });
+        let viewer = view
+            .read_with(cx, |view, _| view.value_viewer().cloned())
+            .expect("viewer should be open");
+        viewer.update(cx, |viewer, cx| viewer.apply(cx));
+
+        view.read_with(cx, |view, _| {
+            assert!(!view.value_viewer_open());
+            assert_eq!(view.pending_change_count(), 0);
         });
     }
 
