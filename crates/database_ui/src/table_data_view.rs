@@ -8315,11 +8315,17 @@ mod tests {
         })
         .await;
 
+        // A real edit target makes the viewer writable, so the draw also covers
+        // the footer's Apply / Set NULL branch, not just the read-only variant.
+        let key = RowKey {
+            columns: vec!["id".into()],
+            values: vec![Some("1".into())],
+        };
         view.update_in(cx, |view, window, cx| {
             view.open_value_viewer(
                 "name".into(),
                 Some(r#"{"a":1}"#.into()),
-                None,
+                Some(EditTarget::Existing(key)),
                 None,
                 window,
                 cx,
