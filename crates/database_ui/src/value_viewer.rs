@@ -59,6 +59,68 @@ fn json_parse_error(text: &str) -> Option<String> {
     }
 }
 
+/// `true`, если `source` и `formatted` отличаются только JSON-незначащими
+/// пробелами (вне строковых литералов). Нужно, потому что round-trip через
+/// `serde_json` нормализует числовые токены: `"1.50"` → `1.5`, `"5.00"` → `5.0`,
+/// огромные целые теряют точность, превращаясь во float. Такое
+/// «форматирование» молча меняет само значение, поэтому автоформат и кнопка
+/// Format предлагаются только когда pretty-форма отличается исключительно
+/// расстановкой пробелов — корректность важнее красоты.
+fn differs_only_in_whitespace(source: &str, formatted: &str) -> bool {
+    // Внутри строкового литерала значим каждый символ (включая пробелы);
+    // снаружи пробелы (только JSON-набор ` \t\n\r`) пропускаются.
+    fn next_significant(
+        chars: &mut std::str::Chars,
+        in_string: &mut bool,
+        escaped: &mut bool,
+    ) -> Option<char> {
+        for ch in chars.by_ref() {
+            if *in_string {
+                if *escaped {
+                    *escaped = false;
+                } else if ch == '\\' {
+                    *escaped = true;
+                } else if ch == '"' {
+                    *in_string = false;
+                }
+                return Some(ch);
+            }
+            if matches!(ch, ' ' | '\t' | '\n' | '\r') {
+                continue;
+            }
+            if ch == '"' {
+                *in_string = true;
+            }
+            return Some(ch);
+        }
+        None
+    }
+
+    let mut source_chars = source.chars();
+    let mut formatted_chars = formatted.chars();
+    let mut source_in_string = false;
+    let mut source_escaped = false;
+    let mut formatted_in_string = false;
+    let mut formatted_escaped = false;
+    loop {
+        let source_char = next_significant(
+            &mut source_chars,
+            &mut source_in_string,
+            &mut source_escaped,
+        );
+        let formatted_char = next_significant(
+            &mut formatted_chars,
+            &mut formatted_in_string,
+            &mut formatted_escaped,
+        );
+        match (source_char, formatted_char) {
+            (None, None) => return true,
+            (Some(left), Some(right)) if left == right => continue,
+            _ => return false,
+        }
+    }
+}
+
 pub struct ValueViewer {
     editor: Entity<Editor>,
     column: SharedString,
@@ -72,6 +134,10 @@ pub struct ValueViewer {
     /// Ошибка парсинга текущего текста; `None` — валиден. Имеет смысл только
     /// при `is_json` и непустом тексте.
     json_error: Option<String>,
+    /// Кэш для render: текущий текст можно безопасно отформатировать (pretty-форма
+    /// отличается только пробелами). Пересчитывается в `refresh_validity`, чтобы
+    /// render не парсил JSON на каждый кадр.
+    can_format: bool,
     _editor_subscription: Subscription,
 }
 
@@ -91,13 +157,19 @@ impl ValueViewer {
         cx: &mut Context<Self>,
     ) -> Self {
         let raw = params.original.clone().unwrap_or_default();
-        let pretty_original = pretty_json(&raw);
+        let is_json =
+            params.declared_json || params.original.as_deref().is_some_and(is_json_document);
+        // Автоформат при открытии — только когда pretty-форма отличается от исходной
+        // строки исключительно пробелами вне строк. Иначе (числовая нормализация
+        // serde) значение открывается как есть, а Raw/Format недоступны.
+        let pretty_original = is_json
+            .then(|| pretty_json(&raw))
+            .flatten()
+            .filter(|pretty| differs_only_in_whitespace(&raw, pretty));
         let initial_text = match params.initial_text {
             Some(text) if text != raw => text,
             _ => pretty_original.clone().unwrap_or_else(|| raw.clone()),
         };
-        let is_json =
-            params.declared_json || params.original.as_deref().is_some_and(is_json_document);
 
         let editor = cx.new(|cx| {
             let buffer = cx.new(|cx| {
@@ -149,6 +221,7 @@ impl ValueViewer {
             is_json,
             read_only: params.read_only,
             json_error: None,
+            can_format: false,
             _editor_subscription,
         };
         viewer.refresh_validity(cx);
@@ -171,6 +244,10 @@ impl ValueViewer {
         self.json_error.as_deref()
     }
 
+    pub fn can_format(&self) -> bool {
+        self.can_format
+    }
+
     fn refresh_validity(&mut self, cx: &App) {
         let text = self.editor_text(cx);
         // Пустой текст (NULL-ячейка) — не «невалидный JSON», индикатор молчит.
@@ -179,6 +256,10 @@ impl ValueViewer {
         } else {
             None
         };
+        // Форматировать безопасно, только если pretty-форма меняет один лишь
+        // пробельный layout: числовая нормализация serde исключается.
+        self.can_format = pretty_json(&text)
+            .is_some_and(|pretty| pretty != text && differs_only_in_whitespace(&text, &pretty));
     }
 
     /// Текст не отредактирован: совпадает с одной из двух базовых форм
@@ -199,15 +280,23 @@ impl ValueViewer {
         self.editor.update(cx, |editor, cx| {
             editor.set_text(raw, window, cx);
         });
+        self.refresh_validity(cx);
     }
 
     fn format_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(pretty) = pretty_json(&self.editor_text(cx)) else {
+        let text = self.editor_text(cx);
+        let Some(pretty) = pretty_json(&text) else {
             return;
         };
+        // Та же защита, что при открытии: не даём числовой нормализации serde
+        // подменить значение под видом форматирования.
+        if !differs_only_in_whitespace(&text, &pretty) {
+            return;
+        }
         self.editor.update(cx, |editor, cx| {
             editor.set_text(pretty, window, cx);
         });
+        self.refresh_validity(cx);
     }
 
     fn copy_value(&self, cx: &mut Context<Self>) {
@@ -243,7 +332,7 @@ impl Render for ValueViewer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let text = self.editor_text(cx);
         let raw_available = self.raw_available(cx);
-        let can_format = pretty_json(&text).is_some_and(|pretty| pretty != text);
+        let can_format = self.can_format;
         let is_null = self.original.is_none() && text.is_empty();
 
         let validity = (self.is_json && !text.is_empty()).then(|| match &self.json_error {
@@ -571,5 +660,87 @@ mod tests {
             events.borrow().is_empty(),
             "read-only Apply must be a no-op"
         );
+    }
+
+    #[gpui::test]
+    async fn numeric_scalar_opens_raw_with_format_disabled(cx: &mut TestAppContext) {
+        init_test(cx);
+        let cx = cx.add_empty_window();
+        // `numeric(10,2)` рендерится как "1.50"; serde бы нормализовал его в "1.5".
+        let viewer = cx.update(|window, cx| {
+            cx.new(|cx| ValueViewer::new(viewer_params(Some("1.50")), None, window, cx))
+        });
+        viewer.read_with(cx, |viewer, cx| {
+            assert_eq!(
+                viewer.editor_text(cx),
+                "1.50",
+                "scalar must open exactly as stored"
+            );
+            assert!(!viewer.is_json());
+            assert!(
+                !viewer.raw_available(cx),
+                "no safe pretty form → Raw disabled"
+            );
+            assert!(
+                !viewer.can_format(),
+                "reformatting would drop the trailing zero"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn json_document_with_normalizing_number_opens_raw(cx: &mut TestAppContext) {
+        init_test(cx);
+        let cx = cx.add_empty_window();
+        // Валидный JSON, но pretty-print сменил бы 1.50 на 1.5 — открываем как есть.
+        let viewer = cx.update(|window, cx| {
+            cx.new(|cx| {
+                ValueViewer::new(viewer_params(Some(r#"{"amount":1.50}"#)), None, window, cx)
+            })
+        });
+        viewer.read_with(cx, |viewer, cx| {
+            assert_eq!(
+                viewer.editor_text(cx),
+                r#"{"amount":1.50}"#,
+                "number-normalizing document must not autoformat"
+            );
+            assert!(viewer.is_json());
+            assert!(
+                viewer.json_error().is_none(),
+                "the raw document is still valid JSON"
+            );
+            assert!(!viewer.raw_available(cx));
+            assert!(!viewer.can_format());
+        });
+    }
+
+    #[test]
+    fn differs_only_in_whitespace_semantics() {
+        // Форматирование, меняющее только раскладку пробелов вне строк.
+        assert!(differs_only_in_whitespace(r#"{"a":1}"#, "{\n  \"a\": 1\n}"));
+        assert!(differs_only_in_whitespace(r#"{"a":1}"#, r#"{"a":1}"#));
+
+        // Числовая нормализация — это уже не только пробелы.
+        assert!(!differs_only_in_whitespace("1.50", "1.5"));
+        assert!(!differs_only_in_whitespace(
+            r#"{"amount":1.50}"#,
+            r#"{"amount":1.5}"#
+        ));
+
+        // Пробелы внутри строкового литерала значимы.
+        assert!(differs_only_in_whitespace(
+            r#"{"a":"x y"}"#,
+            "{\n  \"a\": \"x y\"\n}"
+        ));
+        assert!(!differs_only_in_whitespace(
+            r#"{"a":"x y"}"#,
+            r#"{"a":"xy"}"#
+        ));
+
+        // Экранированная кавычка не закрывает строку раньше времени.
+        let escaped = r#"{"a":"x\"y"}"#;
+        let pretty = pretty_json(escaped).expect("valid JSON");
+        assert!(differs_only_in_whitespace(escaped, &pretty));
+        assert!(!differs_only_in_whitespace(escaped, r#"{"a":"xy"}"#));
     }
 }
